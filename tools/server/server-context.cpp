@@ -39,6 +39,21 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static bool server_sampler_reuse_enabled() {
+    static const bool enabled = common_get_env("LLAMA_SERVER_BACKEND_SAMPLER_REUSE") == "1";
+    return enabled;
+}
+
+static bool server_sampler_preload_enabled() {
+    static const bool enabled = common_get_env("LLAMA_SERVER_BACKEND_SAMPLER_PRELOAD") == "1";
+    return enabled && server_sampler_reuse_enabled();
+}
+
+static bool server_sampler_reuse_trace() {
+    static const bool enabled = common_get_env("LLAMA_SERVER_SAMPLER_REUSE_TRACE") == "1";
+    return enabled;
+}
+
 // Keep this comparison complete when common_params_sampling gains a field.
 static bool server_sampling_params_equal(const common_params_sampling & a, const common_params_sampling & b) {
     if (a.seed                   != b.seed                   ||
@@ -112,6 +127,35 @@ static bool server_sampling_params_equal(const common_params_sampling & a, const
         }
     }
     return true;
+}
+
+static bool server_sampler_preload_params_allowed(const common_params_sampling & params) {
+    return params.backend_sampling && common_grammar_value(params.grammar).empty() &&
+        !params.grammar_lazy && !params.reasoning_control && params.reasoning_budget_tokens < 0;
+}
+
+static bool server_sampler_preload_params_equal(const common_params_sampling & a, const common_params_sampling & b) {
+    if (!server_sampler_preload_params_allowed(a) || !server_sampler_preload_params_allowed(b)) {
+        return false;
+    }
+
+    auto key_a = a;
+    auto key_b = b;
+    // These fields do not construct chain state when grammar and reasoning-budget samplers are absent.
+    auto normalize = [](common_params_sampling & params) {
+        params.user_sampling_config = 0;
+        params.generation_prompt.clear();
+        params.preserved_tokens.clear();
+        params.grammar_triggers.clear();
+        params.reasoning_budget_start.clear();
+        params.reasoning_budget_end.clear();
+        params.reasoning_budget_forced.clear();
+        params.reasoning_budget_message.clear();
+        params.logit_bias_eog.clear();
+    };
+    normalize(key_a);
+    normalize(key_b);
+    return server_sampling_params_equal(key_a, key_b);
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -431,8 +475,9 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
-    // While idle, the retained sampler belongs to task_prev.
+    // Before the first request, the retained sampler belongs to smpl_preload_params; afterwards, to task_prev.
     bool smpl_reuse = false;
+    std::unique_ptr<common_params_sampling> smpl_preload_params;
 
     void clear_sampler_reuse() {
         if (smpl_reuse) {
@@ -440,6 +485,7 @@ struct server_slot {
             llama_set_sampler(ctx_tgt, id, nullptr);
             smpl_reuse = false;
         }
+        smpl_preload_params.reset();
     }
 
     llama_token sampled; // in speculative mode, this is the last accepted token
@@ -1134,6 +1180,9 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        const bool trace_sampler = server_sampler_reuse_trace();
+        const int64_t t_start_us = trace_sampler ? ggml_time_us() : 0;
+
         for (auto & slot : slots) {
             if (slot.smpl_reuse) {
                 slot.clear_sampler_reuse();
@@ -1154,6 +1203,10 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+
+        if (trace_sampler) {
+            SRV_INF("sampler lifecycle: event=destroy_complete elapsed_us=%" PRId64 "\n", ggml_time_us() - t_start_us);
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1209,11 +1262,17 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        const bool trace_sampler = server_sampler_reuse_trace();
+        const int64_t t_start_us = trace_sampler ? ggml_time_us() : 0;
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
         const bool is_resume = sleeping;
+
+        if (trace_sampler) {
+            SRV_INF("sampler lifecycle: event=load_begin resume=%d\n", (int) is_resume);
+        }
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
@@ -1521,6 +1580,11 @@ private:
             return false;
         }
 
+        const bool preload_eligible = server_sampler_preload_enabled() &&
+            params_base.n_parallel == 1 && !params_base.embedding && decision.type == COMMON_DECISION_TYPE_NONE &&
+            params_base.split_mode != LLAMA_SPLIT_MODE_TENSOR && !spec && !ctx_dft && !mctx &&
+            params_base.lora_adapters.empty() && server_sampler_preload_params_allowed(params_base.sampling);
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1546,6 +1610,22 @@ private:
                     metrics_on_prediction(slot);
                 }
             };
+
+            if (preload_eligible) {
+                auto preload_params = std::make_unique<common_params_sampling>(params_base.sampling);
+                common_sampler * smpl_preload = llama_init->release_sampler(slot.id);
+                if (smpl_preload) {
+                    // The context constructor registered this chain before its initial reserve and warmup.
+                    slot.smpl.reset(smpl_preload);
+                    slot.smpl_reuse = true;
+                    slot.smpl_preload_params = std::move(preload_params);
+                }
+            }
+
+            if (trace_sampler) {
+                SRV_INF("sampler preload: event=adopt slot=%d eligible=%d retained=%d resume=%d\n",
+                        slot.id, (int) preload_eligible, (int) slot.smpl_reuse, (int) is_resume);
+            }
 
             slot.reset();
         }
@@ -1630,15 +1710,19 @@ private:
         // propagate new defaults back to caller
         params = params_base;
 
+        bool success = true;
         if (!is_resume) {
-            return init();
-        }
-
-        if (callback_state) {
+            success = init();
+        } else if (callback_state) {
             callback_state(SERVER_STATE_READY, {});
         }
 
-        return true;
+        if (trace_sampler) {
+            SRV_INF("sampler lifecycle: event=load_complete resume=%d success=%d elapsed_us=%" PRId64 "\n",
+                    (int) is_resume, (int) success, ggml_time_us() - t_start_us);
+        }
+
+        return success;
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -2033,29 +2117,24 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
-            static const bool reuse_enabled = [] {
-                const char * value = getenv("LLAMA_SERVER_BACKEND_SAMPLER_REUSE");
-                return value && std::string(value) == "1";
-            }();
-            static const bool reuse_trace = [] {
-                const char * value = getenv("LLAMA_SERVER_SAMPLER_REUSE_TRACE");
-                return value && std::string(value) == "1";
-            }();
-
-            const bool reuse_eligible = reuse_enabled && use_backend_sampling &&
+            const bool reuse_eligible = server_sampler_reuse_enabled() && use_backend_sampling &&
                 params_base.n_parallel == 1 && task.type == SERVER_TASK_TYPE_COMPLETION &&
                 !task.is_child() && task.child_tasks.empty() &&
                 !spec && !ctx_dft && !mctx && slot.lora.empty() && params_base.lora_adapters.empty() &&
                 common_grammar_value(task.params.sampling.grammar).empty() &&
                 !task.params.sampling.grammar_lazy && !task.params.sampling.reasoning_control &&
                 task.params.sampling.reasoning_budget_tokens < 0;
-            const bool reuse_hit = reuse_eligible && slot.smpl_reuse && slot.smpl && slot.task_prev &&
+            const bool reuse_preload = reuse_eligible && slot.smpl_reuse && slot.smpl && slot.smpl_preload_params &&
+                server_sampler_preload_params_equal(*slot.smpl_preload_params, task.params.sampling);
+            const bool reuse_previous = reuse_eligible && slot.smpl_reuse && slot.smpl && slot.task_prev &&
                 server_sampling_params_equal(slot.task_prev->params.sampling, task.params.sampling);
+            const bool reuse_hit = reuse_preload || reuse_previous;
 
             if (reuse_hit) {
                 llama_synchronize(ctx_tgt);
                 // Restore fresh request state without changing the registered chain or its graph inputs.
                 common_sampler_copy(smpl_new.get(), slot.smpl.get());
+                slot.smpl_preload_params.reset();
             } else {
                 slot.clear_sampler_reuse();
                 slot.smpl = std::move(smpl_new);
@@ -2069,9 +2148,10 @@ private:
                 }
             }
 
-            if (reuse_trace) {
-                SLT_INF(slot, "backend sampler reuse: eligible=%d hit=%d retained=%d\n",
-                        (int) reuse_eligible, (int) reuse_hit, (int) slot.smpl_reuse);
+            if (server_sampler_reuse_trace()) {
+                SLT_INF(slot, "backend sampler reuse: eligible=%d hit=%d retained=%d source=%s\n",
+                        (int) reuse_eligible, (int) reuse_hit, (int) slot.smpl_reuse,
+                        reuse_preload ? "preload" : reuse_previous ? "previous" : "miss");
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());

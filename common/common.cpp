@@ -1397,6 +1397,14 @@ common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
     return pimpl->samplers[seq_id].get();
 }
 
+common_sampler * common_init_result::release_sampler(llama_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
+        return nullptr;
+    }
+    pimpl->samplers_seq_config[seq_id].sampler = nullptr;
+    return pimpl->samplers[seq_id].release();
+}
+
 void common_init_result::reset_samplers() {
     for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
         llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
